@@ -1,7 +1,11 @@
-import argparse, warnings
-import importlib, torch, os
+import argparse
+import os
+import importlib
+
 import os.path as osp
-from datetime import datetime
+import torch
+from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import fp16_compress_hook
+
 from data_process.distreamify import VideoDataset
 from model.i3d_arcface import I3D_ResNet
 from model.losses import CombinedMarginLoss
@@ -10,8 +14,23 @@ from model.partial_fc_v2 import PartialFC_V2
 from torch.utils.data import DataLoader
 from torch import distributed
 from utils.loggings import AverageMeter, CallBackLogging, init_logging
+from data_process.data_loader_ddp import get_dataloader
 
-warnings.filterwarnings('ignore')
+try:
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    distributed.init_process_group("nccl")
+except KeyError:
+    rank = 0
+    local_rank = 0
+    world_size = 1
+    distributed.init_process_group(
+        backend="nccl",
+        init_method="tcp://127.0.0.1:12584",
+        rank=rank,
+        world_size=world_size,
+    )
 
 def get_config(config_file):
     assert config_file.startswith('configs/'), 'config file setting must start with configs/'
@@ -27,54 +46,27 @@ def get_config(config_file):
     return cfg
 
 def main(args):
-
-    # get config
     cfg = get_config(args.config)
-    device = torch.device('cuda')
-    rank = 0
-    local_rank = 0
-    world_size = 1
-    distributed.init_process_group(
-        backend="nccl",
-        init_method="tcp://127.0.0.1:12584",
-        rank=rank,
-        world_size=world_size,
-    )
+    torch.cuda.set_device(local_rank)
     os.makedirs(cfg.output, exist_ok=True)
     init_logging(rank, cfg.output)
 
     video_dataset = VideoDataset(data_path=cfg.data, save_root=cfg.dataset_output, 
                                  max_frames=cfg.max_frame, recorded=cfg.dataset_recorded)
-    train_loader = DataLoader(video_dataset, batch_size=cfg.batch_size, shuffle=True, drop_last=True)
     num_image = len(video_dataset)
     num_classes = len(set(video_dataset.labels))
-
-    wandb_logger = None
-    if cfg.using_wandb:
-        import wandb
-        try:
-            wandb.login(key=cfg.wandb_key)
-        except Exception as e:
-            print(f"Config WandB error: {e}")
-        run_name = datetime.now().strftime('%y%m%d_%H%M') + f'_GPU{rank}'
-        run_name = run_name if cfg.suffix_run_name is None else run_name + f"_{cfg.suffix_run_name}"
-        try:
-            wandb_logger = wandb.init(
-                entity = cfg.wandb_entity, 
-                project = cfg.wandb_project, 
-                sync_tensorboard = True,
-                resume=cfg.wandb_resume,
-                name = run_name) if rank == 0 or cfg.wandb_log_all else None
-            if wandb_logger:
-                wandb_logger.config.update(cfg)
-        except Exception as e:
-            print(f"Config WandB error: {e}")
-
+    train_loader = get_dataloader(video_dataset, local_rank,
+                                  batch_size=cfg.batch_size,
+                                  seed=cfg.seed,
+                                  num_workers=cfg.num_workers)
+    
     backbone = I3D_ResNet(layers=[3, 4, 14, 3], backbone_2d_path='./ckpt/backbone_2d.pth').cuda()
-    if cfg.pretrain:
-        D = torch.load(cfg.pretrain)
-        backbone.load_state_dict(D)
+    backbone = torch.nn.parallel.DistributedDataParallel(
+        module=backbone, broadcast_buffers=False, device_ids=[local_rank], bucket_cap_mb=16,
+        find_unused_parameters=True)
+    backbone.register_comm_hook(None, fp16_compress_hook)
     backbone.train()
+    backbone._set_static_graph()
 
     margin_loss = CombinedMarginLoss(
         64,
@@ -83,7 +75,7 @@ def main(args):
         cfg.margin_list[2],
         cfg.interclass_filtering_threshold
     )
-    
+
     if cfg.optimizer == "sgd":
         module_partial_fc = PartialFC_V2(
             margin_loss, cfg.embedding_size, num_classes,
@@ -113,19 +105,9 @@ def main(args):
         optimizer=opt,
         warmup_iters=cfg.warmup_step,
         total_iters=cfg.total_step)
-
+    
     start_epoch = 0
     global_step = 0
-    if cfg.resume:
-        pass
-        # dict_checkpoint = torch.load(os.path.join(cfg.output, f"checkpoint_gpu_{rank}.pt"))
-        # start_epoch = dict_checkpoint["epoch"]
-        # global_step = dict_checkpoint["global_step"]
-        # backbone.module.load_state_dict(dict_checkpoint["state_dict_backbone"])
-        # module_partial_fc.load_state_dict(dict_checkpoint["state_dict_softmax_fc"])
-        # opt.load_state_dict(dict_checkpoint["state_optimizer"])
-        # lr_scheduler.load_state_dict(dict_checkpoint["state_lr_scheduler"])
-        # del dict_checkpoint
     callback_logging = CallBackLogging(
         frequent=cfg.frequent,
         total_step=cfg.total_step,
@@ -136,9 +118,9 @@ def main(args):
     amp = torch.cuda.amp.grad_scaler.GradScaler(growth_interval=100)
 
     for epoch in range(start_epoch, cfg.num_epoch):
+        if isinstance(train_loader, DataLoader):
+            train_loader.sampler.set_epoch(epoch)
         for _, (img, local_labels, _) in enumerate(train_loader):
-            img = img.to(device)
-            local_labels = local_labels.to(device)
             global_step += 1
             local_embeddings = backbone(img)
             loss: torch.Tensor = module_partial_fc(local_embeddings, local_labels)
@@ -157,18 +139,9 @@ def main(args):
                     opt.step()
                     opt.zero_grad()
             lr_scheduler.step()
-
             with torch.no_grad():
-                if wandb_logger:
-                    wandb_logger.log({
-                        'Loss/Step Loss': loss.item(),
-                        'Loss/Train Loss': loss_am.avg,
-                        'Process/Step': global_step,
-                        'Process/Epoch': epoch
-                    })
                 loss_am.update(loss.item(), 1)
                 callback_logging(global_step, loss_am, epoch, cfg.fp16, lr_scheduler.get_last_lr()[0], amp)
-
         if cfg.save_all_states:
             checkpoint = {
                 "epoch": epoch + 1,
@@ -179,24 +152,15 @@ def main(args):
                 "state_lr_scheduler": lr_scheduler.state_dict()
             }
             torch.save(checkpoint, os.path.join(cfg.output, f"checkpoint_gpu_{rank}.pt"))
-
         if rank == 0:
             path_module = os.path.join(cfg.output, f"model_epoch-{epoch}.pt")
             torch.save(backbone.state_dict(), path_module)
-            if wandb_logger and cfg.save_artifacts:
-                artifact_name = f"{run_name}_E{epoch}"
-                model = wandb.Artifact(artifact_name, type='model')
-                model.add_file(path_module)
-                wandb_logger.log_artifact(model)
-
     if rank == 0:
         path_module = os.path.join(cfg.output, "model_final.pt")
         torch.save(backbone.state_dict(), path_module)
 
-
-if __name__ == "__main__":
+if __name__ == "main":
     torch.backends.cudnn.benchmark = True
-    parser = argparse.ArgumentParser(
-        description="Distributed Arcface Training in Pytorch")
-    parser.add_argument("config", type=str, help="py config file")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("config", type=str)
     main(parser.parse_args())
